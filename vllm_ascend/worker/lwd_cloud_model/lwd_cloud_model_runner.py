@@ -886,10 +886,18 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             )
 
     def _lwd_h2d_stream(self) -> torch.npu.Stream:
-        """Return the dedicated stream used for host-window copies."""
+        """Return the dedicated stream used for host-window copies.
+
+        Warm up the first H2D read on this stream so the first-read
+        transient happens during bring-up instead of on the first real request.
+        """
         stream = getattr(self, "_lwd_h2d_copy_stream", None)
         if stream is None:
             stream = torch.npu.Stream()
+            dummy_src = torch.zeros(1, dtype=torch.bfloat16, device="cpu", pin_memory=True)
+            dummy_dst = torch.zeros(1, dtype=torch.bfloat16, device=self.device)
+            dummy_dst.copy_(dummy_src, non_blocking=False)
+            torch.npu.current_stream().synchronize()
             self._lwd_h2d_copy_stream = stream
         return stream
 

@@ -51,6 +51,7 @@ from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import (
 from vllm_ascend.ops.fused_moe.moe_utils import async_all_to_all, gather_from_sequence_parallel_region
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import should_skip_allreduce_across_dp_group
+from vllm_ascend.worker.lwd_cloud_model.lwd_dp_trace import lwd_dp_count
 
 EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
 EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
@@ -626,6 +627,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             .numpy()
         )
 
+        lwd_dp_count("ep_gather")
         num_global_tokens_per_expert = gather_from_sequence_parallel_region(
             num_local_tokens_per_expert, group=self.ep_group
         ).reshape(ep_size, self.num_experts)

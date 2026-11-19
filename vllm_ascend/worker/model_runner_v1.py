@@ -221,6 +221,7 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataTaskProvider,
 )
 from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
+from vllm_ascend.worker.lwd_cloud_model.lwd_dp_trace import lwd_dp_count, lwd_dp_trace
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.utils import (
     AscendKVBlockZeroer,
@@ -829,6 +830,7 @@ class NPUModelRunner(GPUModelRunner):
         packed_tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
+        lwd_dp_count("dp_sync")
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
 
         # Unpack the results
@@ -1896,6 +1898,12 @@ class NPUModelRunner(GPUModelRunner):
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
+        lwd_dp_trace(
+            "draft",
+            dp=self.dp_rank,
+            k=scheduler_output.num_spec_tokens_to_schedule,
+            tokens=num_scheduled_tokens,
+        )
         self._log_propose_draft_token_ids_entry(spec_decode_metadata, num_scheduled_tokens)
 
         # Reset cached draft probs from the previous step so that stale data
@@ -2218,6 +2226,11 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        lwd_dp_trace(
+            "model-step",
+            dp=self.dp_rank,
+            tokens=scheduler_output.total_num_scheduled_tokens,
+        )
         self._cpp_execution_time_ms = None
         profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
         execution_start_time = _start_profiling_chunk_timing(
@@ -2702,6 +2715,7 @@ class NPUModelRunner(GPUModelRunner):
         sampled_token_ids: torch.Tensor | None = None,
     ) -> None:
         """Preserve sampled state and DP alignment; publish zero draft placeholders."""
+        lwd_dp_trace("draft-skip", dp=self.dp_rank)
         if (
             sampled_token_ids is not None
             and self.valid_sampled_token_count_event is not None

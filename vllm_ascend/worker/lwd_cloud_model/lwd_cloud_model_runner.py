@@ -332,9 +332,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             self.lwd_engram_inputs.plan_step(
                 self._lwd_engram_batch_view(self.input_batch.num_reqs),
                 num_scheduled_tokens,
-                self._lwd_engram_staging(
-                    "engram_row_codes", torch.int32, self.lwd_engram_inputs.row_codes_capacity
-                ),
+                self._lwd_engram_staging("engram_row_codes", torch.int32, self.lwd_engram_inputs.row_codes_capacity),
             )
         return out
 
@@ -733,9 +731,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         """
         layout = self._lwd_up_layout_cached
         if layout is None:
-            layout = LwdUpPayloadLayout.from_hf_config(
-                self.model_config.get_hidden_size(), self.model_config.hf_config
-            )
+            layout = LwdUpPayloadLayout.from_hf_config(self.model_config.get_hidden_size(), self.model_config.hf_config)
             self._lwd_up_layout_cached = layout
         return layout
 
@@ -1085,7 +1081,6 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         if dev is None:
             return
         layout = self.lwd_up_layout()
-        hidden_size = layout.hidden_size
         total_rows = sum(window.rows for window in plan)
         # Same split as the wire payload: the broadcast window is one batch.
         embeds, expert_ids, engram_hashes = layout.unpack(dev, total_rows)
@@ -1112,9 +1107,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             if engram is not None:
                 if engram_hashes is None:
                     raise RuntimeError(f"[Lwd][cloud-runner] missing UP Engram hashes for {window.req_id}")
-                # The record is created by the first chunk and holds the whole
-                # request's spans; later chunks must present none.
-                spans = self._lwd_image_spans.get(window.req_id, []) if window.start == 0 else []
+                # The first received chunk creates the record, even when a
+                # prefix hit makes its prompt offset nonzero.
+                spans = self._lwd_image_spans.get(window.req_id, [])
                 engram.add_prompt_chunk(
                     window.req_id,
                     window.start,

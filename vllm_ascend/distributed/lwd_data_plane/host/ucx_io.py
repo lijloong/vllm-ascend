@@ -45,6 +45,7 @@ from typing import Any, Literal
 
 import torch
 from vllm.logger import logger
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.lwd_comm.data_comm.ucx_channel import (
     LwdHostDoneEvent,
     LwdUcxConfig,
@@ -159,7 +160,8 @@ class LwdNpuUcxChannelIo:
         # Dedicated copy stream for segmented D2H (built at recv-side
         # construction to avoid creating streams on the lib IO thread)
         self._copy_stream: torch.npu.Stream | None = torch.npu.Stream() if config.op == "recv" else None
-        # First-frame delimitation traces (error level, once per IO each)
+        # First-frame delimitation traces (lwd_logger INFO, silent by default:
+        # VLLM_LWD_LOG_LEVEL=info turns them on), once per IO each
         self._tr_submit_send = True
         self._tr_send_done = True
         self._tr_d2h = True
@@ -212,8 +214,8 @@ class LwdNpuUcxChannelIo:
         self._stream.wait_stream(producer)
         if self._tr_submit_send:
             self._tr_submit_send = False
-            logger.error(
-                "[lwd-ucx-trace] %s SUBMIT_SEND seqno=%s payload=%dB aux=%dB sq=%d",
+            lwd_logger.info(
+                "[ucx-trace] %s SUBMIT_SEND seqno=%s payload=%dB aux=%dB sq=%d",
                 self.tag,
                 seqno,
                 self._nbytes(tensor),
@@ -235,8 +237,8 @@ class LwdNpuUcxChannelIo:
         tag = seqno if seqno is not None else _NO_SEQNO_TAG
         if self._tr_submit_recv:
             self._tr_submit_recv = False
-            logger.error(
-                "[lwd-ucx-trace] %s SUBMIT_RECV seqno=%s tag=%d numel=%s aux_numel=%s stage=%s",
+            lwd_logger.info(
+                "[ucx-trace] %s SUBMIT_RECV seqno=%s tag=%d numel=%s aux_numel=%s stage=%s",
                 self.tag,
                 seqno,
                 tag,
@@ -288,7 +290,7 @@ class LwdNpuUcxChannelIo:
             try:
                 self._do_send(seqno, tensor, aux_tensor, future)
             except Exception as exc:  # noqa: BLE001
-                logger.exception("[lwd-ucx-trace] %s SEND_FAILED seqno=%s err=%r", self.tag, seqno, exc)
+                logger.exception("[ucx-trace] %s SEND_FAILED seqno=%s err=%r", self.tag, seqno, exc)
                 with contextlib.suppress(Exception):
                     future._finalize(error=exc)
 
@@ -318,8 +320,8 @@ class LwdNpuUcxChannelIo:
                     adst.copy_(aux_tensor.reshape(adst.shape))
             if self._tr_d2h:
                 self._tr_d2h = False
-                logger.error(
-                    "[lwd-ucx-trace] %s SEND_D2H seqno=%s dur=%.1fms "
+                lwd_logger.info(
+                    "[ucx-trace] %s SEND_D2H seqno=%s dur=%.1fms "
                     "(copy returned means host-readable; no such line = "
                     "stuck in D2H or staging acquire)",
                     self.tag,
@@ -340,7 +342,7 @@ class LwdNpuUcxChannelIo:
         def cb(op) -> None:  # noqa: ANN001 - LwdUcxOp (lib IO thread)
             if self._tr_send_done:
                 self._tr_send_done = False
-                logger.error("[lwd-ucx-trace] %s SEND_DONE tag=%d size=%s err=%r", self.tag, op.tag, op.size, op.error)
+                lwd_logger.info("[ucx-trace] %s SEND_DONE tag=%d size=%s err=%r", self.tag, op.tag, op.size, op.error)
             # op completion = data handed over: return the staging block
             # to the library pool.
             self._ch.release_staging(stg)
@@ -373,8 +375,8 @@ class LwdNpuUcxChannelIo:
         def cb(op) -> None:  # noqa: ANN001 - LwdUcxOp (lib IO thread)
             if self._tr_recv_done:
                 self._tr_recv_done = False
-                logger.error(
-                    "[lwd-ucx-trace] %s RECV_DONE tag=%d len=%s err=%r",
+                lwd_logger.info(
+                    "[ucx-trace] %s RECV_DONE tag=%d len=%s err=%r",
                     tag_str,
                     op.tag,
                     len(op.data) if op.data is not None else None,

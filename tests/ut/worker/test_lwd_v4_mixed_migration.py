@@ -386,10 +386,10 @@ class TestH2DStagedVerification(unittest.TestCase):
         self.dev = torch.zeros(2)
 
     def stage(self):
-        stream = NS(wait_event=Mock())
+        self.h2d_stream = NS(wait_event=Mock(), synchronize=Mock())
         compute_stream = NS(wait_event=Mock(), synchronize=Mock())
         npu = NS(
-            Stream=lambda: stream,
+            Stream=lambda: self.h2d_stream,
             stream=lambda stream: nullcontext(),
             Event=lambda: NS(record=Mock()),
             current_stream=lambda: compute_stream,
@@ -397,12 +397,23 @@ class TestH2DStagedVerification(unittest.TestCase):
         with patch.object(torch, "npu", npu, create=True):
             self.runner._lwd_stage_window(self.stager, self.plan, self.dev, 0, 2, 0)
 
+    def test_first_window_primes_the_real_embedding_slice(self):
+        self.stage()
+
+        self.assertEqual(self.runner._lwd_stage_one_request.call_count, 2)
+        prime_call, staging_call = self.runner._lwd_stage_one_request.call_args_list
+        self.assertEqual(prime_call.args[0], staging_call.args[0])
+        self.assertEqual(prime_call.args[1], staging_call.args[1])
+        self.assertIs(prime_call.args[2], staging_call.args[2])
+        self.assertEqual(prime_call.args[3:], staging_call.args[3:])
+        self.h2d_stream.synchronize.assert_called_once()
+
     def test_only_first_window_is_verified(self):
         for _ in range(2):
             self.stage()
 
         self.assertEqual(self.runner._lwd_verify_staged_plan.call_count, 1)
-        self.assertEqual(self.runner._lwd_stage_one_request.call_count, 2)
+        self.assertEqual(self.runner._lwd_stage_one_request.call_count, 3)
 
     def test_new_stream_restarts_verification(self):
         self.stage()
@@ -530,7 +541,10 @@ class TestMixedInjection(unittest.TestCase):
                 self.stream = stream
                 events.append(("record", self))
 
-        self.h2d_stream = NS(wait_event=lambda event: events.append(("h2d_wait", event)))
+        self.h2d_stream = NS(
+            wait_event=lambda event: events.append(("h2d_wait", event)),
+            synchronize=Mock(),
+        )
         self.compute_stream = NS(
             wait_event=lambda event: events.append(("compute_wait", event)),
             synchronize=lambda: None,
@@ -579,7 +593,7 @@ class TestMixedInjection(unittest.TestCase):
         with patch.object(torch.Tensor, "copy_", new=recording_copy):
             self.inject()
 
-        self.assertEqual(len(copies), 4)
+        self.assertEqual(len(copies), 5)
         self.assertTrue(all(copies))
 
     def test_preemption_rereads_embeddings_and_dsv4_tail(self):

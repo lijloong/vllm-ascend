@@ -772,7 +772,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         hidden_size: int,
         tail_per_row: int,
     ) -> None:
-        """Submit host embeddings and expert tails on the dedicated H2D stream."""
+        """Prime the first real slice, then submit embeddings and tails on the dedicated H2D stream."""
         started = time.monotonic()
         embed_numel = sum(window.rows for window in plan) * hidden_size
         stream = self._lwd_h2d_stream()
@@ -780,6 +780,12 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         with torch.npu.stream(stream):
             if used_event is not None:
                 stream.wait_event(used_event)
+            if not self._lwd_h2d_verified:
+                # Prime the first request's real host source and destination
+                # slice before the actual submission. Normal staging below
+                # still runs; verification remains the correctness guard.
+                self._lwd_stage_one_request(stager, plan[0], dev, 0, hidden_size)
+                stream.synchronize()
             embed_offset = 0
             tail_offset = embed_numel
             for window in plan:

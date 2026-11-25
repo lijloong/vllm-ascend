@@ -1023,10 +1023,23 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             raise RuntimeError(f"[Lwd][cloud-runner] invalid host window for {window.req_id}")
         req = stager.take_req(window.req_id)
         assert req is not None
+        if blocking:
+            lwd_logger.info(
+                "[LWD][cloud-runner] H2D first-copy probe req=%s elems=%d src_sum=%.3f",
+                window.req_id,
+                numel,
+                float(req.host[host_start : host_start + numel].abs().sum()),
+            )
         dev[elem_offset : elem_offset + numel].copy_(
             req.host[host_start : host_start + numel],
             non_blocking=not blocking,
         )
+        if blocking:
+            lwd_logger.info(
+                "[LWD][cloud-runner] H2D first-copy probe req=%s dst_sum=%.3f",
+                window.req_id,
+                float(dev[elem_offset : elem_offset + numel].abs().sum()),
+            )
 
     def _lwd_inject_remote_embeds(
         self,

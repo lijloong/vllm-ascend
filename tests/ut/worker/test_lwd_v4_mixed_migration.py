@@ -398,6 +398,7 @@ class TestH2DStagedVerification(unittest.TestCase):
             stream=lambda stream: nullcontext(),
             Event=lambda: NS(record=Mock()),
             current_stream=lambda: compute_stream,
+            synchronize=lambda: None,
         )
         with patch.object(torch, "npu", npu, create=True):
             self.runner._lwd_stage_window(self.stager, self.plan, self.dev, 0, 2, 0)
@@ -408,6 +409,13 @@ class TestH2DStagedVerification(unittest.TestCase):
 
         self.assertEqual(self.runner._lwd_verify_staged_plan.call_count, 1)
         self.assertEqual(self.runner._lwd_stage_one_request.call_count, 2)
+
+    def test_first_window_blocks_then_later_windows_go_async(self):
+        for _ in range(2):
+            self.stage()
+
+        blocking = [call.kwargs["blocking"] for call in self.runner._lwd_stage_one_request.call_args_list]
+        self.assertEqual(blocking, [True, False])
 
     def test_new_stream_restarts_verification(self):
         self.stage()
@@ -545,6 +553,7 @@ class TestMixedInjection(unittest.TestCase):
             stream=lambda stream: nullcontext(),
             Event=Event,
             current_stream=lambda: self.compute_stream,
+            synchronize=lambda: None,
         )
         parallel = NS(get_tp_group=lambda: tp_group or NS(world_size=1))
         self.runner._fake_tp_group = tp_group or NS(world_size=1)
@@ -572,7 +581,7 @@ class TestMixedInjection(unittest.TestCase):
         self.assertEqual(self.stager.consumed_rows("a"), 4)
         self.assertEqual(self.stager.consumed_rows("b"), 2)
 
-    def test_h2d_copies_are_submitted_without_blocking(self):
+    def test_first_window_copies_are_blocking(self):
         original_copy = torch.Tensor.copy_
         copies = []
 
@@ -585,7 +594,7 @@ class TestMixedInjection(unittest.TestCase):
             self.inject()
 
         self.assertEqual(len(copies), 4)
-        self.assertTrue(all(copies))
+        self.assertFalse(any(copies))
 
     def test_preemption_rereads_embeddings_and_dsv4_tail(self):
         self.runner.input_batch.num_computed_tokens_cpu = [0, 9, 0]

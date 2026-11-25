@@ -624,6 +624,7 @@ class LwdCloudWorker(LwdWorkerBase):
                     blocked.add(connection)
                     continue
                 future.result()
+                staged_bound = future.staged_event_bound()
                 stage_key = (connection, seqno)
                 published = stager.publish_received(stage_key)
                 stager.release_if_drained(stage_key)
@@ -651,12 +652,13 @@ class LwdCloudWorker(LwdWorkerBase):
             # parked by a full done MQ; ``backlog`` (reports already waiting
             # when this one was harvested) is the backlog signal.
             lwd_logger.info(
-                "[Lwd][pre-recv] REPORT connection=%s channel=%s seqno=%d arrivals=%s backlog=%d",
+                "[Lwd][pre-recv] REPORT connection=%s channel=%s seqno=%d arrivals=%s backlog=%d staged_event=%s",
                 connection,
                 channel.value,
                 seqno,
                 arrived,
                 backlog,
+                staged_bound,
             )
         # One flush per pass covers the whole pending FIFO in order: last
         # pass's leftovers, this pass's reports, and any error a fail path

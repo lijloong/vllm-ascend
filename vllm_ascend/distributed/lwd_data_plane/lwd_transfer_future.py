@@ -186,6 +186,15 @@ class LwdTransferFuture:
                     self._done_cond.notify_all()
             return True
 
+    def staged_event_bound(self) -> bool:
+        """Whether a D2H staging event gates this future's host data.
+
+        An unbound future reports ``staged_done()`` as done, so arrivals
+        published from it have no device-side ordering behind the pinned
+        buffer.
+        """
+        return self._staged_event is not None
+
     def release_device_tensor(self) -> None:
         """Release a staged receive's device slot, not a normal recv result."""
         if self._staged_event is None:

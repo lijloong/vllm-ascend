@@ -155,6 +155,9 @@ class FakeFuture:
             return True
         return self.is_staged
 
+    def staged_event_bound(self) -> bool:
+        return True
+
     def release_device_tensor(self) -> None:
         self.events.append("release")
 

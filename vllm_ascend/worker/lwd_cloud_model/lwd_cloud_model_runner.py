@@ -832,6 +832,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 dev[embed_offset : embed_offset + numel],
                 req.host[host_start : host_start + numel],
                 window.req_id,
+                "embed",
             )
             embed_offset += numel
             if tail_per_row:
@@ -841,11 +842,19 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     dev[tail_offset : tail_offset + tail_numel],
                     req.host[tail_start : tail_start + tail_numel],
                     window.req_id,
+                    "tail",
                     strict=False,
                 )
                 tail_offset += tail_numel
 
-    def _lwd_h2d_verify_after_ready(self, dst: torch.Tensor, src: torch.Tensor, rid: str, strict: bool = True) -> None:
+    def _lwd_h2d_verify_after_ready(
+        self,
+        dst: torch.Tensor,
+        src: torch.Tensor,
+        rid: str,
+        segment: str,
+        strict: bool = True,
+    ) -> None:
         """Verify an asynchronous copy after ready_event and retry once on mismatch.
 
         Root-cause fix for the 2E2C cold-start first window (2026-11, ported
@@ -867,6 +876,12 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         ``strict=False`` is for the expert-ID tail: retry once but never fail
         because zero expert-ID bytes are legitimate. Verification runs for
         the first window on each H2D stream.
+
+        ``segment`` labels the slice (``embed`` or ``tail``) in the probe
+        logs: a mismatch reports which segment and how large it was, plus the
+        destination and source absolute sums, so a zero destination can be
+        told apart from a partially written one. The retry outcome is logged
+        too, which separates "recovered by one retry" from "still broken".
 
         The compute stream waits on ready_event before this readback. Only a
         mismatching slice pays for a blocking retry on the compute stream; no
@@ -896,15 +911,40 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
 
         if samples_match():
             return
+        elem_count = dst.shape[0]
+        dst_sum = float(dst.abs().sum())
+        src_sum = float(src.abs().sum())
         lwd_logger.warning(
-            "[LWD][cloud-runner] H2D first-copy mismatch req=%s after ready_event; retrying",
+            "[LWD][cloud-runner] H2D first-copy mismatch req=%s segment=%s elems=%d "
+            "dst_sum=%.3f src_sum=%.3f zero_dst=%s; retrying",
             rid,
+            segment,
+            elem_count,
+            dst_sum,
+            src_sum,
+            dst_sum == 0.0,
         )
         dst.copy_(src, non_blocking=False)
         torch.npu.current_stream().synchronize()
-        if strict and not samples_match():
+        if samples_match():
+            lwd_logger.info(
+                "[LWD][cloud-runner] H2D retry recovered req=%s segment=%s elems=%d",
+                rid,
+                segment,
+                elem_count,
+            )
+            return
+        lwd_logger.warning(
+            "[LWD][cloud-runner] H2D retry still mismatched req=%s segment=%s elems=%d dst_sum=%.3f src_sum=%.3f",
+            rid,
+            segment,
+            elem_count,
+            float(dst.abs().sum()),
+            float(src.abs().sum()),
+        )
+        if strict:
             raise RuntimeError(
-                f"[LWD][cloud-runner] H2D copy mismatch twice req={rid} "
+                f"[LWD][cloud-runner] H2D copy mismatch twice req={rid} segment={segment} "
                 "(source and destination samples differ after retry)"
             )
 

@@ -297,7 +297,7 @@ class TestH2DVerifyAfterReady(unittest.TestCase):
     def verify(self, src, dst, *, strict=True):
         npu = NS(current_stream=lambda: self.stream)
         with patch.object(torch, "npu", npu, create=True):
-            self.runner._lwd_h2d_verify_after_ready(dst, src, "req", strict=strict)
+            self.runner._lwd_h2d_verify_after_ready(dst, src, "req", "embed", strict=strict)
 
     def test_lost_async_copy_is_retried(self):
         src = FakeCopyTensor(torch.tensor([1.0, 2.0, 3.0]))
@@ -309,6 +309,11 @@ class TestH2DVerifyAfterReady(unittest.TestCase):
         self.assertEqual(dst.non_blocking, [False])
         self.stream.synchronize.assert_called_once()
         self.logger.warning.assert_called_once()
+        self.logger.info.assert_called_once()
+        log_format, *log_args = self.logger.warning.call_args[0]
+        self.assertIn("segment=", log_format)
+        self.assertIn("zero_dst=", log_format)
+        self.assertIn("embed", log_args)
 
     def test_head16_zero_but_full_window_loss_is_retried(self):
         src = FakeCopyTensor(torch.cat([torch.zeros(16), torch.tensor([1.0])]))
@@ -351,7 +356,7 @@ class TestH2DVerifyAfterReady(unittest.TestCase):
                     self.verify(src, dst, strict=False)
                 self.assertEqual(dst.non_blocking, [False])
                 self.stream.synchronize.assert_called_once()
-                self.logger.warning.assert_called_once()
+                self.assertEqual(self.logger.warning.call_count, 2)
 
     def test_mismatching_nan_honors_strict_mode(self):
         src = FakeCopyTensor(torch.tensor([torch.nan, 1.0]))

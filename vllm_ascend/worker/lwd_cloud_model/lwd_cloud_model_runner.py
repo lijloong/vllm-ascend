@@ -774,12 +774,12 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     ) -> None:
         """Submit host embeddings and expert tails on the dedicated H2D stream.
 
-        The first window after a stream is created copies synchronously: an
-        asynchronous first copy can reach the readback with part of the
-        window still unwritten (observed as NaN destination sums), and only a
-        blocking copy guarantees the readback sees what the source held.
-        Later windows keep the asynchronous copies and the ready_event
-        ordering.
+        The first window after a stream is created copies synchronously and
+        drains the device before the readback: in the field a blocking copy
+        alone still reached the readback with part of the window unwritten
+        (NaN or partially written destination sums), and only an explicit
+        device synchronize made the destination match the source. Later
+        windows keep the asynchronous copies and the ready_event ordering.
         """
         started = time.monotonic()
         embed_numel = sum(window.rows for window in plan) * hidden_size
@@ -814,6 +814,12 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             ready_event = torch.npu.Event()
             ready_event.record(stream)
         torch.npu.current_stream().wait_event(ready_event)
+        if first_window:
+            # The blocking copies above still reached the readback half
+            # written in the field unless something touched the device
+            # afterwards, so drain every stream before the readback instead
+            # of trusting the per-stream event, and only for this window.
+            torch.npu.synchronize()
         if not self._lwd_h2d_verified:
             self._lwd_verify_staged_plan(stager, plan, dev, embed_numel, tail_per_row)
             self._lwd_h2d_verified = True

@@ -398,6 +398,7 @@ class TestH2DStagedVerification(unittest.TestCase):
             stream=lambda stream: nullcontext(),
             Event=lambda: NS(record=Mock()),
             current_stream=lambda: compute_stream,
+            synchronize=lambda: None,
         )
         with patch.object(torch, "npu", npu, create=True):
             self.runner._lwd_stage_window(self.stager, self.plan, self.dev, 0, 2, 0)
@@ -552,6 +553,7 @@ class TestMixedInjection(unittest.TestCase):
             stream=lambda stream: nullcontext(),
             Event=Event,
             current_stream=lambda: self.compute_stream,
+            synchronize=lambda: None,
         )
         parallel = NS(get_tp_group=lambda: tp_group or NS(world_size=1))
         self.runner._fake_tp_group = tp_group or NS(world_size=1)

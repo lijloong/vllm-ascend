@@ -772,18 +772,43 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         hidden_size: int,
         tail_per_row: int,
     ) -> None:
-        """Submit host embeddings and expert tails on the dedicated H2D stream."""
+        """Submit host embeddings and expert tails on the dedicated H2D stream.
+
+        The first window drains the device before copying and copies
+        synchronously: the pinned source is filled by the staging stream, and
+        a copy issued before that D2H lands captures a half-written window
+        (field logs show NaN or partially written destination sums that the
+        readback then reports as a mismatch). Once the source is stable, the
+        blocking copy reproduces it exactly. Later windows keep the
+        asynchronous copies and the ready_event ordering.
+        """
         started = time.monotonic()
         embed_numel = sum(window.rows for window in plan) * hidden_size
         stream = self._lwd_h2d_stream()
         used_event = self._lwd_win_used_ev[win_idx]
+        first_window = not self._lwd_h2d_verified
+        if first_window:
+            # The pinned source is filled by the staging stream. Until that
+            # D2H lands the buffer holds a half-written window, and a copy
+            # taken at that moment carries the garbage into the destination,
+            # which the readback then reports as a mismatch even though the
+            # copy itself is faithful. Drain once before reading the source
+            # instead of trusting the arrival bookkeeping.
+            torch.npu.synchronize()
         with torch.npu.stream(stream):
             if used_event is not None:
                 stream.wait_event(used_event)
             embed_offset = 0
             tail_offset = embed_numel
             for window in plan:
-                self._lwd_stage_one_request(stager, window, dev, embed_offset, hidden_size)
+                self._lwd_stage_one_request(
+                    stager,
+                    window,
+                    dev,
+                    embed_offset,
+                    hidden_size,
+                    blocking=first_window,
+                )
                 embed_offset += window.rows * hidden_size
                 if tail_per_row:
                     req = stager.take_req(window.req_id)
@@ -792,7 +817,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     numel = window.rows * tail_per_row
                     dev[tail_offset : tail_offset + numel].copy_(
                         req.host[tail_start : tail_start + numel],
-                        non_blocking=True,
+                        non_blocking=not first_window,
                     )
                     tail_offset += numel
             ready_event = torch.npu.Event()
@@ -949,6 +974,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         dev: torch.Tensor,
         elem_offset: int,
         hidden_size: int,
+        *,
+        blocking: bool = False,
     ) -> None:
         """Copy one host window after enforcing the native read watermark."""
         computed = self.input_batch.num_computed_tokens_cpu
@@ -967,7 +994,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         assert req is not None
         dev[elem_offset : elem_offset + numel].copy_(
             req.host[host_start : host_start + numel],
-            non_blocking=True,
+            non_blocking=not blocking,
         )
 
     def _lwd_inject_remote_embeds(

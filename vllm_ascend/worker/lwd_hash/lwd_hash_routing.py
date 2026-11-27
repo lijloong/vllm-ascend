@@ -4,10 +4,13 @@
 The expert ids travel UP as a segment of `lwd_up_payload.LwdUpPayloadLayout`.
 """
 
+from collections.abc import Sequence
+from typing import Any
+
 import torch
 
 
-def hash_layer_count(config: "PretrainedConfig") -> int:
+def hash_layer_count(config: Any) -> int:
     """Return the Hash MoE layer count for DeepSeek V4; zero for other models."""
     return config.num_hash_layers if getattr(config, "model_type", None) == "deepseek_v4" else 0
 
@@ -40,9 +43,7 @@ class LwdHashRoutingState:
         """Release a request's expert IDs and validity mask; a missing request is a no-op."""
         self.requests.pop(req_id, None)
 
-    def add_chunk(
-        self, req_id: str, prompt_len: int, start: int, expert_ids: torch.Tensor
-    ) -> None:
+    def add_chunk(self, req_id: str, prompt_len: int, start: int, expert_ids: torch.Tensor) -> None:
         """Validate a remote expert-ID chunk, write it into the request's absolute prompt position and mark it valid."""
         ids = expert_ids.to(device="cpu", dtype=torch.int32)
         if ids.ndim != 3 or tuple(ids.shape[1:]) != (self.num_layers, self.top_k):
@@ -50,8 +51,13 @@ class LwdHashRoutingState:
         end = start + ids.shape[0]
         if not 0 <= start <= end <= prompt_len:
             raise ValueError(f"Invalid LWD expert chunk for {req_id}: [{start}, {end})/{prompt_len}")
-        if torch.any(ids < 0) or torch.any(ids >= self.num_experts):
-            raise ValueError(f"LWD expert IDs out of range for {req_id}")
+        invalid = (ids < 0) | (ids >= self.num_experts)
+        if torch.any(invalid):
+            raise ValueError(
+                f"LWD expert IDs out of range for {req_id}: "
+                f"values={ids[invalid].tolist()} positions={torch.nonzero(invalid).tolist()} "
+                f"chunk=[{start}, {end})/{prompt_len} num_experts={self.num_experts}"
+            )
         entry = self.requests.get(req_id)
         if entry is None or entry[0].shape[0] != prompt_len:
             entry = (
@@ -64,12 +70,14 @@ class LwdHashRoutingState:
 
     def build_batch(
         self,
-        req_ids: "Sequence[str]",
-        counts: "Sequence[int]",
-        computed: "Sequence[int]",
-        prompt_lengths: "Sequence[int]",
-    ) -> "tuple[torch.Tensor, torch.Tensor]":
-        """Assemble CPU expert IDs and the prompt mask by request order and computed positions; raise when prompt data is missing."""
+        req_ids: Sequence[str],
+        counts: Sequence[int],
+        computed: Sequence[int],
+        prompt_lengths: Sequence[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Assemble CPU expert IDs and the prompt mask by request order and computed positions;
+        raise when prompt data is missing.
+        """
         if not len(req_ids) == len(counts) == len(computed) == len(prompt_lengths):
             raise ValueError("LWD Hash routing batch metadata lengths do not match")
         total = sum(int(n) for n in counts)

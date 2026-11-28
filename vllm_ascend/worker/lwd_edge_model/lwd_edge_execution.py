@@ -14,6 +14,7 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import LwdEmbedBatch, LwdUnembedBatch
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.lwd_control.lwd_exceptions import LwdTransferFailedError
 from vllm.v1.lwd_control.lwd_model.deepseek_v41.lwd_engram_hasher import LwdEngramHasher
 from vllm.v1.outputs import ModelRunnerOutput
 
@@ -55,6 +56,12 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
     def _init_lwd_edge_execution(self, worker: LwdWorkerBase | None) -> None:
         self.worker = worker
         self.pin_memory = PIN_MEMORY
+        # Containment is host-comm-only: device comm (HCCL) has no dynamic
+        # link and keeps its original "a transfer failure kills the engine"
+        # semantics. Captured once at construction, never read on the
+        # request path. Shared by the V1 and V2 edge runners.
+        lwd_config = self.vllm_config.lwd_config
+        self._lwd_host_comm = lwd_config is not None and lwd_config.topology.deployment.data_plane_comm == "host"
         self._lwd_staging_rings: dict[str, LwdPinnedStaging] = {}
         self.mm_cache = LwdEdgeMmCache()
         self.tid2eid_tables: list[torch.Tensor] = []
@@ -154,13 +161,36 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
         pending = self._lwd_up_send_inflight.setdefault(request.connection, deque())
         pending.append((request.seqno, future))
 
+    def _lwd_raise_transfer_failure(
+        self,
+        connection: ConnectionId,
+        seqnos: list[int],
+        exc: BaseException,
+        req_ids: list[str] | None = None,
+    ) -> None:
+        """Contain a transfer failure at request level on HOST comm: the
+        engine aborts the involved requests and keeps serving. Device comm
+        (HCCL) has no dynamic link and keeps the original semantics, so the
+        original exception propagates untouched."""
+        if self._lwd_host_comm:
+            raise LwdTransferFailedError(connection, seqnos, req_ids) from exc
+        raise exc
+
     def _lwd_pop_completed_up_sends(self) -> None:
-        """Advance each connection watermark across its successful FIFO prefix."""
+        """Advance each connection watermark across its successful FIFO prefix.
+
+        A failed send settles its batch here and raises the contained
+        LwdTransferFailedError instead of killing the engine: the watermark
+        still advances so later successful sends release.
+        """
         for connection, pending in self._lwd_up_send_inflight.items():
             while pending and pending[0][1].done():
-                seqno, future = pending[0]
-                future.result()
-                pending.popleft()
+                seqno, future = pending.popleft()
+                try:
+                    future.result()
+                except Exception as exc:
+                    self._lwd_up_send_watermarks[connection] = seqno
+                    self._lwd_raise_transfer_failure(connection, [seqno], exc)
                 self._lwd_up_send_watermarks[connection] = seqno
 
     def _lwd_watermarked_output(self, connection: ConnectionId | None = None) -> ModelRunnerOutput:
@@ -332,21 +362,32 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
             return self._lwd_watermarked_output()
 
         _t0 = time.monotonic()
-        recv_future = self.worker.comm_service.submit_recv(
-            LwdTransferRequest(
-                channel=LwdChannelType.DOWN,
-                op="recv",
-                num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
-                dp_idx=connection.dp_idx,
-                edge_id=connection.edge_id,
-                cloud_id=connection.cloud_id,
-                seqno=seqno,
+        try:
+            recv_future = self.worker.comm_service.submit_recv(
+                LwdTransferRequest(
+                    channel=LwdChannelType.DOWN,
+                    op="recv",
+                    num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
+                    dp_idx=connection.dp_idx,
+                    edge_id=connection.edge_id,
+                    cloud_id=connection.cloud_id,
+                    seqno=seqno,
+                )
             )
-        )
+        except Exception as exc:
+            # Containment: the DOWN receive cannot be posted; the batch's
+            # requests abort instead of the engine dying.
+            self._lwd_raise_transfer_failure(connection, [seqno], exc, req_ids=list(batch_meta.req_ids))
         _t_post = time.monotonic()
         # wait_on_current_stream: device-ordered wait; the host never blocks
-        recv_future.wait_on_current_stream()
-        result = recv_future.result()
+        try:
+            recv_future.wait_on_current_stream()
+            result = recv_future.result()
+        except Exception as exc:
+            # Containment: the frame never arrived intact (link break or
+            # transport error); the batch's requests abort instead of the
+            # engine dying.
+            self._lwd_raise_transfer_failure(connection, [seqno], exc, req_ids=list(batch_meta.req_ids))
         result.tensor.record_stream(torch.npu.current_stream())
         _t_tensor = time.monotonic()
         hidden_size = self.model_config.get_hidden_size()

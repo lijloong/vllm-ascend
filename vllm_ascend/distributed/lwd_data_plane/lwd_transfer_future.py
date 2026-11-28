@@ -171,8 +171,12 @@ class LwdTransferFuture:
     # Host staging                                                        #
     # ------------------------------------------------------------------ #
 
-    def staged_done(self) -> bool:
-        """Query D2H completion without blocking the communication thread."""
+    def staged_done(self, *, fail_closed: bool = False) -> bool:
+        """Query D2H completion without blocking the communication thread.
+
+        Cleanup passes ``fail_closed=True``: an event query error is not
+        evidence that the device stopped using its receive buffer.
+        """
         event = self._staged_event
         if event is None:
             return True
@@ -184,7 +188,7 @@ class LwdTransferFuture:
                     self._status = LwdTransferStatus.ERROR
                     self._error = exc
                     self._done_cond.notify_all()
-            return True
+            return not fail_closed
 
     def release_device_tensor(self) -> None:
         """Release a staged receive's device slot, not a normal recv result."""

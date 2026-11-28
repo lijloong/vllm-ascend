@@ -31,7 +31,12 @@ from vllm.logger import logger
 
 from vllm_ascend.distributed.lwd_data_plane import lwd_channels
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId, LwdChannelType, LwdTransferRequest
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
+    ConnectionId,
+    LwdChannelType,
+    LwdLinkError,
+    LwdTransferRequest,
+)
 
 
 def lwd_scramble_seed_for(request: LwdTransferRequest) -> int | None:
@@ -59,6 +64,10 @@ def lwd_scramble_seed_for(request: LwdTransferRequest) -> int | None:
 class LwdTransferQueue:
     """One FIFO of pending requests for one DP connection, channel and op."""
 
+    # HCCL requires the original zero-based stream. Host queues opt into
+    # first-frame baselining because a restarted UCX peer may continue.
+    _lazy_seqno_baseline = False
+
     def __init__(self, connection: ConnectionId, channel_type: LwdChannelType, op: str) -> None:
         self.connection = connection
         self.dp_idx = self.connection.dp_idx
@@ -69,7 +78,7 @@ class LwdTransferQueue:
         # The pending-queue lock alone cannot prevent two host threads
         # from interleaving HCCL calls of separate requests.
         self._submission_lock = threading.Lock()
-        self._next_seqno: int | None = None
+        self._next_seqno: int | None = None if self._lazy_seqno_baseline else 0
         self._held: dict[int, tuple[LwdTransferRequest, LwdTransferFuture]] = {}
         # Abort holes: seqnos the peer will never submit (aborted
         # requests).  Skipped when advancing so one abort cannot wedge
@@ -87,9 +96,7 @@ class LwdTransferQueue:
         control-plane abort on both sides) — skipping a seqno the peer
         later submits is a pairing error and raises at submission."""
         with self._submission_lock:
-            if self._next_seqno is None:
-                self._next_seqno = 0
-            if seqno < self._next_seqno:
+            if seqno < (self._next_seqno or 0):
                 return  # already passed
             # A held (out-of-order) entry for an aborted seqno must never
             # be executed: discard it and fail its deferred future so any
@@ -109,6 +116,27 @@ class LwdTransferQueue:
                 held_request, held_future = self._held.pop(self._next_seqno)
                 self._execute_next(held_request, into=held_future)
                 self._next_seqno += 1
+
+    def reset_peer_baseline(self) -> None:
+        """Peer restarted (session fingerprint changed at link adopt): its
+        seqno stream continues at an unknown value, so fail the held frames
+        of the old stream and re-baseline the FIFO. Host queues take the next
+        arriving frame as their baseline; device queues return to zero.
+        Posted ops of the broken link are already terminated by the
+        transport; the connection is coming back, so this is not an abort."""
+        with self._submission_lock:
+            stale, self._held = self._held, {}
+            self._skipped.clear()
+            self._next_seqno = None if self._lazy_seqno_baseline else 0
+            # A stale abort verdict would reject every submit of the NEW
+            # stream: the connection is coming back, not aborting.
+            self._abort_error = None
+            for _request, held_future in stale.values():
+                held_future._finalize(
+                    error=LwdLinkError(
+                        f"peer restarted; dropped held seqno on channel {self.channel_type.value} {self.op}"
+                    )
+                )
 
     # ------------------------------------------------------------------ #
     # Submission                                                          #
@@ -160,8 +188,9 @@ class LwdTransferQueue:
         seqno = request.seqno
         assert seqno is not None
         if self._next_seqno is None:
-            # Contract: per-channel seqno counters start at 0.
-            self._next_seqno = 0
+            # Only host queues use a lazy baseline: a restarted peer's
+            # counter may continue against this fresh (or reset) queue.
+            self._next_seqno = seqno
         self._advance_past_skipped()
         if seqno in self._skipped or seqno < self._next_seqno:
             # A skipped (aborted) seqno can still arrive when the peer's

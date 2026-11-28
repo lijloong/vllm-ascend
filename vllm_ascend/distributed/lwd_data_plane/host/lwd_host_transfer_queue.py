@@ -2,9 +2,11 @@
 """LwdHostTransferQueue: the host (UCX) implementation of one (dp, channel, op)
 FIFO.
 
-Subclasses the HCCL ``LwdTransferQueue`` and swaps only the execution
-layer: seqno reorder buffering, skip/abort bookkeeping, snapshot and
-reap semantics are inherited unchanged (they are transport-agnostic).
+Subclasses the HCCL ``LwdTransferQueue`` and swaps the execution layer
+plus the seqno baseline policy: host peers may continue their counters
+after a restart, so the first frame re-baselines the queue. Seqno reorder
+buffering, skip/abort bookkeeping, snapshot and reap semantics are inherited
+unchanged (they are otherwise transport-agnostic).
 The HCCL-specific device-stream FIFO bridging is replaced by the UCX
 link's own ordering (seqno IS the wire tag), so no predecessor event
 chaining is needed.
@@ -48,6 +50,8 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
 class LwdHostTransferQueue(LwdTransferQueue):
     """One FIFO of pending requests for one DP connection, channel and op,
     backed by a UCX host-RoCE link."""
+
+    _lazy_seqno_baseline = True
 
     def skip_seqno(self, seqno: int) -> None:
         # Inherited bookkeeping first (held-future failing, hole advance),
